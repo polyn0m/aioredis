@@ -5,9 +5,11 @@ from unittest import mock
 
 from aioredis import (
     ReadOnlyError,
+    ConnectionClosedError,
     ReplyError,
     log,
     )
+from aioredis.util import async_task
 
 
 pytestmark = pytest.redis_version(2, 8, 0, reason="Sentinel v2 required")
@@ -27,11 +29,56 @@ def test_sentinel2(sentinel, create_sentinel):
 @pytest.mark.run_loop(timeout=40)
 def test_failover2(start_sentinel, start_server,
                    create_sentinel, create_connection, loop):
-    server1 = start_server('master-failover')
-    server2 = start_server('slave-failover', slaveof=server1)
-    sentinel = start_sentinel('sentinel-failover', server1)
+    server1 = start_server('master-failover', ['slave-read-only yes'])
+    server2 = start_server('slave-failover1', ['slave-read-only yes'],
+                           slaveof=server1)
+    server3 = start_server('slave-failover2', ['slave-read-only yes'],
+                           slaveof=server1)
 
-    sp = yield from create_sentinel([sentinel.tcp_address])
+    @asyncio.coroutine
+    def listen_redis(name, addr):
+        conn = yield from create_connection(addr)
+        debug = log.logger.getChild('test').debug
+        while True:
+            try:
+                role = yield from conn.execute('role')
+                debug("\t\t%s %d Role: %r", name, addr[1], role)
+                if name.startswith('SN'):
+                    f1 = conn.execute('sentinel', 'masters')
+                    f2 = conn.execute('sentinel', 'slaves', server1.name)
+                    f3 = conn.execute('sentinel', 'get-master-addr-by-name',
+                                      server1.name)
+                    masters = yield from f1
+                    slaves = yield from f2
+                    a = yield from f3
+                    masters = [dict(zip(m[::2], m[1::2])) for m in masters]
+                    masters = [(m[b'port'], m[b'flags'], m[b'role-reported'])
+                               for m in masters]
+                    slaves = [dict(zip(m[::2], m[1::2])) for m in slaves]
+                    slaves = [(s[b'port'], s[b'flags'], s[b'role-reported'])
+                              for s in slaves]
+                    masters = a, masters, slaves
+                    debug("\t\t%s %d Role: %r", name, addr[1], masters)
+            except ConnectionClosedError as err:
+                debug("%s %d ReconnErr: %r", name, addr[1], err)
+                conn = yield from create_connection(addr)
+                continue
+            except Exception as err:
+                debug("%s %d Err: %r", name, addr[1], err)
+                break
+            yield from asyncio.sleep(.5, loop=loop)
+    async_task(listen_redis('M1', server1.tcp_address), loop=loop)
+    async_task(listen_redis('S1', server2.tcp_address), loop=loop)
+    async_task(listen_redis('S2', server3.tcp_address), loop=loop)
+
+    sentinel1 = start_sentinel('sentinel-failover1', server1, quorum=2)
+    sentinel2 = start_sentinel('sentinel-failover2', server1, quorum=2)
+
+    async_task(listen_redis('SN1', sentinel1.tcp_address), loop=loop)
+    async_task(listen_redis('SN2', sentinel2.tcp_address), loop=loop)
+
+    sp = yield from create_sentinel([sentinel1.tcp_address,
+                                     sentinel2.tcp_address])
 
     _, old_port = yield from sp.master_address(server1.name)
     # ignoring host
@@ -43,7 +90,7 @@ def test_failover2(start_sentinel, start_server,
     # wait failover
     conn = yield from create_connection(server1.tcp_address)
     log.logger.debug("Setting connection to sleep")
-    yield from conn.execute("debug", "sleep", 6)
+    yield from conn.execute("debug", "sleep", 10)
     log.logger.debug("Debug sleep ended")
     yield from asyncio.sleep(15, loop=loop)
 
